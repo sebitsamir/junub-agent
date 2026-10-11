@@ -82,7 +82,7 @@ Local providers offer privacy and zero cost. Cloud providers offer superior reas
 ### From Source
 
 bash
-git clone https://github.com/YOUR_USERNAME/junub-agent.git
+git clone https://github.com/sebitsamir/junub-agent.git
 cd junub-agent
 pnpm install
 pnpm build

@@ -30,7 +30,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private pendingEdit: PendingEdit | null = null;
   private pendingCommand: PendingCommand | null = null;
   private pendingEditIsAutoFix: boolean = false;
+  private pendingFailedCommand: string | null = null;
   private pendingFilmFix: { path: string; timelinePath: string; relinks: any[] } | null = null;
+  private pendingActionPlan: any[] | null = null;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -70,6 +72,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._postMessage({ type: 'result', status: 'rejected', title: 'Command Cancelled', detail: 'No command was executed.' });
       } else if (data.type === 'autoFix') {
         await this._handleAutoFix(data.command, data.stdout, data.stderr);
+      } else if (data.type === 'executePlan') {
+        await this._executeActionPlan();
       }
     });
   }
@@ -100,6 +104,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         parts.push('DevDependencies: ' + (devDeps.length > 0 ? devDeps.join(', ') : 'none'));
         if (pkg.scripts) parts.push('Scripts: ' + Object.keys(pkg.scripts).join(', '));
       } catch { /* no package.json */ }
+
+      // UNIVERSAL LANGUAGE DETECTION
+      try {
+        const detection = await this.transport.request('workspace.detectLanguage', { path: workspaceFolder }) as any;
+        if (detection.languages && detection.languages.length > 0) {
+          parts.push('\n=== PROJECT TECHNOLOGY STACK ===');
+          if (detection.languages.length > 0) parts.push('Programming Languages: ' + detection.languages.join(', '));
+          if (detection.frameworks && detection.frameworks.length > 0) parts.push('Frameworks: ' + detection.frameworks.join(', '));
+          if (detection.libraries && detection.libraries.length > 0) parts.push('Key Libraries: ' + detection.libraries.join(', '));
+          if (detection.buildTools && detection.buildTools.length > 0) parts.push('Build Tools: ' + detection.buildTools.join(', '));
+          if (detection.packageManagers && detection.packageManagers.length > 0) parts.push('Package Managers: ' + detection.packageManagers.join(', '));
+          if (detection.testFrameworks && detection.testFrameworks.length > 0) parts.push('Test Frameworks: ' + detection.testFrameworks.join(', '));
+          if (detection.databases && detection.databases.length > 0) parts.push('Databases: ' + detection.databases.join(', '));
+          if (detection.cssFrameworks && detection.cssFrameworks.length > 0) parts.push('CSS Frameworks: ' + detection.cssFrameworks.join(', '));
+          if (detection.mobile && detection.mobile.length > 0) parts.push('Mobile Platforms: ' + detection.mobile.join(', '));
+          if (detection.devOps && detection.devOps.length > 0) parts.push('DevOps/Infrastructure: ' + detection.devOps.join(', '));
+          if (detection.entryPoints && detection.entryPoints.length > 0) parts.push('Entry Points: ' + detection.entryPoints.join(', '));
+          parts.push('Primary Ecosystem: ' + (detection.primaryEcosystem || 'unknown'));
+          parts.push('Detection Confidence: ' + (detection.confidence || 'unknown'));
+          parts.push('================================\n');
+        }
+      } catch { /* detection failed silently */ }
+
       try {
         const srcTree = await this._listDir(path.join(workspaceFolder, 'src'), '', 2);
         if (srcTree) parts.push('\nsrc/ structure:\n' + srcTree);
@@ -140,43 +167,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   // -------------------------------------------------------------------------
-  // Intent Parsing
+  // Intent Parsing (Universal Command Routing)
   // -------------------------------------------------------------------------
-  private _parseCommandRequest(message: string): { command: string; args: string[]; description: string } | null {
+  private async _parseCommandRequest(message: string): Promise<{ command: string; args: string[]; description: string } | null> {
     const lower = message.toLowerCase();
-    if (lower.startsWith('run ') || lower.startsWith('execute ') || lower.startsWith('start ')) {
+    if (!lower.startsWith('run ') && !lower.startsWith('execute ') && !lower.startsWith('start ')) {
+      return null;
+    }
+
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!workspaceFolder) {
       const cmdStr = message.replace(/^(run|execute|start)\s+/i, '').trim();
-      const commandMap: Record<string, { command: string; args: string[]; description: string }> = {
-        'tests': { command: 'npm', args: ['test'], description: 'Run all tests' },
-        'test': { command: 'npm', args: ['test'], description: 'Run all tests' },
-        'all tests': { command: 'npm', args: ['test'], description: 'Run all tests' },
-        'the tests': { command: 'npm', args: ['test'], description: 'Run all tests' },
-        'the test': { command: 'npm', args: ['test'], description: 'Run all tests' },
-        'build': { command: 'npm', args: ['run', 'build'], description: 'Build the project' },
-        'lint': { command: 'npm', args: ['run', 'lint'], description: 'Run linter' },
-        'dev': { command: 'npm', args: ['run', 'dev'], description: 'Start dev server' },
-      };
-      const matched = commandMap[cmdStr.toLowerCase()];
-      if (matched) return matched;
-
-      const pkgTestMatch = cmdStr.match(/tests?\s+(?:for|of)\s+(?:the\s+)?(\w+)/i) || cmdStr.match(/(\w+)\s+tests?/i);
-      if (pkgTestMatch && pkgTestMatch[1]) {
-        const pkg = pkgTestMatch[1].toLowerCase();
-        const stopWords = ['the', 'all', 'my', 'some', 'these', 'those'];
-        if (!stopWords.includes(pkg)) {
-          return {
-            command: 'pnpm',
-            args: ['--filter', '@junub-agent/' + pkg, 'test'],
-            description: 'Run tests for the ' + pkg + ' package',
-          };
-        }
-      }
-
       const parts = cmdStr.split(/\s+/).filter(p => p.length > 0);
       if (parts.length === 0) return null;
       return { command: parts[0]!, args: parts.slice(1), description: 'Run: ' + cmdStr };
     }
-    return null;
+
+    try {
+      const resolved = await this.transport.request('workspace.resolveCommand', {
+        intent: message,
+        workspacePath: workspaceFolder
+      }) as any;
+
+      if (resolved && resolved.success) {
+        return {
+          command: resolved.command,
+          args: resolved.args,
+          description: resolved.description,
+        };
+      }
+    } catch (e) {
+      this.outputChannel.appendLine('[Chat] Command resolution failed: ' + (e as Error).message);
+    }
+
+    const cmdStr = message.replace(/^(run|execute|start)\s+/i, '').trim();
+    const parts = cmdStr.split(/\s+/).filter(p => p.length > 0);
+    if (parts.length === 0) return null;
+    return { command: parts[0]!, args: parts.slice(1), description: 'Run generic command: ' + cmdStr };
   }
 
   private _parseEditRequest(message: string): { filePath: string; instruction: string } | null {
@@ -193,13 +220,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return null;
   }
 
-  // -------------------------------------------------------------------------
-  // Domain Intent Parsing (The Multi-Domain Engine)
-  // -------------------------------------------------------------------------
   private _parseDomainRequest(message: string): { domain: string; action: string; path: string } | null {
     const lower = message.toLowerCase();
 
-    // FILM DOMAIN INTENTS
     if (lower.includes('inspect film') || lower.includes('check media') || lower.includes('verify timeline')) {
       return { domain: 'film', action: 'inspect', path: '.' };
     }
@@ -217,13 +240,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.outputChannel.appendLine('[Chat] User: ' + message);
     this.history.push({ role: 'user', content: message });
 
-    const cmdRequest = this._parseCommandRequest(message);
+    const cmdRequest = await this._parseCommandRequest(message);
     if (cmdRequest) { await this._handleCommandRequest(cmdRequest); return; }
 
     const editRequest = this._parseEditRequest(message);
     if (editRequest) { await this._handleEditRequest(editRequest.filePath, editRequest.instruction); return; }
 
-    // MULTI-DOMAIN ROUTER
     const domainRequest = this._parseDomainRequest(message);
     if (domainRequest) {
       await this._handleDomainRequest(domainRequest);
@@ -233,7 +255,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._postMessage({ type: 'status', text: 'Reading workspace context...' });
     try {
       const workspaceContext = await this._readWorkspaceContext();
-      this._postMessage({ type: 'status', text: 'Analyzing your question...' });
+      this._postMessage({ type: 'status', text: 'Analyzing request and planning actions...' });
 
       const result = await this.transport.request('chat.query', {
         message, history: this.history.slice(-6), workspaceContext,
@@ -244,9 +266,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
+      // AUTONOMOUS ACTION PLAN EXECUTION
+      if (result.isActionPlan && result.actions && result.actions.length > 0) {
+        this.pendingActionPlan = result.actions;
+        let executionLog = result.actions.map((a: any, i: number) =>
+          `Step ${i + 1}: ${a.type === 'edit' ? 'Edit ' + a.filePath : 'Run ' + a.command + ' ' + (a.args || []).join(' ')}`
+        );
+
+        this.history.push({ role: 'assistant', content: 'Generated autonomous action plan.' });
+        this._postMessage({
+          type: 'plan',
+          steps: executionLog,
+        });
+        return;
+      }
+
+      // NORMAL TEXT RESPONSE
       const responseText = result.response || 'No response received.';
       this.history.push({ role: 'assistant', content: responseText });
       this._postMessage({ type: 'response', text: this._formatMarkdown(responseText) });
+
     } catch (error: any) {
       this._postMessage({ type: 'result', status: 'error', title: 'Query Failed', detail: error.message || String(error) });
     }
@@ -417,17 +456,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // Auto-Fix Flow (The Agentic Loop)
   // -------------------------------------------------------------------------
   private async _handleAutoFix(command: string, stdout: string, stderr: string) {
-    this._postMessage({ type: 'status', text: 'Analyzing error to find the broken file...' });
+    this._postMessage({ type: 'status', text: 'Analyzing error to generate a multi-step fix...' });
     try {
       const diag = await this.transport.request('chat.diagnose', { command, stdout, stderr }) as any;
 
+      if (diag.actions && Array.isArray(diag.actions) && diag.actions.length > 0) {
+        this._postMessage({ type: 'status', text: `Executing ${diag.actions.length} auto-fix steps...` });
+        for (const action of diag.actions) {
+          if (action.type === 'edit') {
+            await this._autoApplyEdit(action.filePath, action.instruction);
+          } else if (action.type === 'run') {
+            await this._autoRunCommand(action.command, action.args || []);
+          }
+        }
+        // After applying all fix steps, re-run the original failed command to verify
+        this._postMessage({ type: 'status', text: 'Verifying auto-fix by re-running the failed command...' });
+        const cmdParts = command.split(' ');
+        if (cmdParts.length > 0 && cmdParts[0]) {
+          await this._autoRunCommand(cmdParts[0], cmdParts.slice(1));
+        }
+        return;
+      }
+
+      // Fallback to old single-file edit if the LLM didn't output actions
       if (!diag.filePath) {
-        this._postMessage({ type: 'result', status: 'error', title: 'Cannot Auto-Fix', detail: diag.instruction || 'Could not identify a specific file to fix.' });
+        this._postMessage({ type: 'result', status: 'error', title: 'Cannot Auto-Fix', detail: diag.fallbackInstruction || diag.instruction || 'Could not identify a specific file to fix.' });
         return;
       }
 
       this._postMessage({ type: 'status', text: 'Found issue in ' + diag.filePath + '. Generating fix...' });
-      await this._handleEditRequest(diag.filePath, diag.instruction, true);
+      await this._handleEditRequest(diag.filePath, diag.instruction, true, command);
 
     } catch (e: any) {
       this._postMessage({ type: 'result', status: 'error', title: 'Auto-Fix Failed', detail: e.message || String(e) });
@@ -437,7 +495,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // -------------------------------------------------------------------------
   // File Edit Flow
   // -------------------------------------------------------------------------
-  private async _handleEditRequest(filePath: string, instruction: string, isAutoFix: boolean = false) {
+  private async _handleEditRequest(filePath: string, instruction: string, isAutoFix: boolean = false, failedCmd: string | null = null) {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!workspaceFolder) {
       this._postMessage({ type: 'result', status: 'error', title: 'No Workspace', detail: 'No workspace is currently open.' });
@@ -469,11 +527,92 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       };
 
       this.pendingEditIsAutoFix = isAutoFix;
+      this.pendingFailedCommand = failedCmd;
 
       const lineDiff = this._countChangedLines(result.originalContent, result.editedContent);
       this._postMessage({ type: 'edit', filePath: filePath, instruction: instruction, changes: lineDiff });
     } catch (error: any) {
       this._postMessage({ type: 'result', status: 'error', title: 'Edit Failed', detail: error.message || String(error) });
+    }
+  }
+
+  private async _executeActionPlan() {
+    if (!this.pendingActionPlan) return;
+    const actions = this.pendingActionPlan;
+    this.pendingActionPlan = null;
+
+    for (let i = 0; i < actions.length; i++) {
+      const action = actions[i];
+      if (action.type === 'edit') {
+        this._postMessage({ type: 'status', text: `Step ${i + 1}/${actions.length}: Auto-editing ${action.filePath}...` });
+        await this._autoApplyEdit(action.filePath, action.instruction);
+      } else if (action.type === 'run') {
+        this._postMessage({ type: 'status', text: `Step ${i + 1}/${actions.length}: Auto-running ${action.command}...` });
+        await this._autoRunCommand(action.command, action.args || []);
+      }
+    }
+    this._postMessage({ type: 'status', text: 'Autonomous plan execution complete.' });
+  }
+
+  private async _autoApplyEdit(filePath: string, instruction: string) {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!workspaceFolder) return;
+    const fullPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceFolder, filePath);
+
+    try {
+      // Ensure the parent directory exists before attempting to read or write
+      await fs.mkdir(path.dirname(fullPath), { recursive: true });
+
+      let fileContent = '';
+      try { fileContent = await fs.readFile(fullPath, 'utf8'); } catch { /* empty file */ }
+
+      const result = await this.transport.request('chat.edit', { filePath: fullPath, instruction, fileContent }) as any;
+      if (result.error) throw new Error(result.error.message);
+
+      const backupPath = fullPath + '.bak';
+      await fs.writeFile(backupPath, fileContent, 'utf8');
+      await fs.writeFile(fullPath, result.editedContent, 'utf8');
+
+      this._postMessage({ type: 'response', text: this._formatMarkdown(`**Auto-Edit Applied:** \`${filePath}\``) });
+    } catch (e: any) {
+      this._postMessage({ type: 'result', status: 'error', title: 'Auto-Edit Failed', detail: e.message });
+    }
+  }
+
+  private async _autoRunCommand(command: string, args: string[]) {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '.';
+    try {
+      const result = await this.transport.request('chat.run', { command, args, cwd: workspaceFolder }) as any;
+      let success = result.exitCode === 0 && !result.timedOut;
+
+      // SPECIAL HANDLING: If a test command times out due to watch mode (--watchAll),
+      // analyze the output to determine if tests actually passed.
+      if (result.timedOut) {
+        const output = ((result.stdout || '') + (result.stderr || '')).replace(/\x1b\[[0-9;]*m/g, '');
+        const hasPass = output.includes('PASS ') || /Tests:\s+\d+ passed/.test(output);
+        const hasFail = output.includes('FAIL ') || /failed/.test(output);
+        // Only count as success if there are passes AND zero failures
+        if (hasPass && !hasFail && output.includes('Test Suites:')) {
+          success = true;
+        }
+      }
+
+      let detail = `Command: ${command} ${args.join(' ')}\nExit code: ${result.exitCode}\n`;
+      if (result.stdout) detail += `\n--- stdout ---\n${result.stdout.trim().slice(-1000)}`;
+      if (result.stderr) detail += `\n--- stderr ---\n${result.stderr.trim().slice(-1000)}`;
+
+      this._postMessage({
+        type: 'result',
+        status: success ? 'success' : 'failure',
+        title: success ? 'Auto-Command Succeeded' : 'Auto-Command Failed',
+        detail,
+        stdout: result.stdout || '',
+        stderr: result.stderr || '',
+        exitCode: result.exitCode,
+        command: `${command} ${args.join(' ')}`
+      });
+    } catch (e: any) {
+      this._postMessage({ type: 'result', status: 'error', title: 'Auto-Command Error', detail: e.message });
     }
   }
 
@@ -496,8 +635,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           status: 'success',
           title: 'Film Fix Applied and Verified',
           detail: 'Successfully relinked ' + result.fixedCount + ' media files.\n' +
-                  'Timeline: ' + this.pendingFilmFix.timelinePath + '\n' +
-                  'All media references are now linked.',
+            'Timeline: ' + this.pendingFilmFix.timelinePath + '\n' +
+            'All media references are now linked.',
         });
         this.history.push({ role: 'assistant', content: 'Fixed ' + result.fixedCount + ' missing media links in ' + this.pendingFilmFix.timelinePath });
       } else {
@@ -565,9 +704,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (isAutoFix) {
         this._postMessage({ type: 'status', text: 'Verifying AI fix by re-running build...' });
 
+        // Re-run the exact command that failed, or fallback to build
+        const cmdToRun = this.pendingFailedCommand || 'npm run build';
+        const cmdParts = cmdToRun.split(' ');
         const verifyResult = await this.transport.request('chat.run', {
-          command: 'npm',
-          args: ['run', 'build'],
+          command: cmdParts[0],
+          args: cmdParts.slice(1),
           cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '.',
         }) as any;
 
@@ -593,6 +735,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       this.pendingEdit = null;
       this.pendingEditIsAutoFix = false;
+      this.pendingFailedCommand = null;
 
     } catch (error: any) {
       this._postMessage({ type: 'result', status: 'error', title: 'Save Failed', detail: error.message || String(error) });
@@ -771,6 +914,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       scrollToBottom();
     }
 
+    function addPlanCard(steps) {
+      removeStatus();
+      const div = document.createElement('div');
+      div.className = 'action-card';
+      div.innerHTML =
+        '<h4><span class="codicon codicon-rocket"></span> Autonomous Plan Ready</h4>' +
+        '<p>I have planned ' + steps.length + ' steps to implement your request:</p>' +
+        '<ul style="margin: 8px 0 8px 20px; line-height: 1.6;">' + steps.map(s => '<li>' + escapeHtml(s) + '</li>').join('') + '</ul>' +
+        '<div class="action-bar">' +
+          '<button class="btn-success" onclick="executePlan()"><span class="codicon codicon-play"></span> Execute Entire Plan</button>' +
+        '</div>';
+      chatContainer.appendChild(div);
+      scrollToBottom();
+    }
+
     function escapeHtml(text) {
       if (!text) return '';
       return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -785,6 +943,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     function approveEdit() { vscode.postMessage({ type: 'approveEdit' }); removeLastActionBar(); }
     function rejectEdit() { vscode.postMessage({ type: 'rejectEdit' }); removeLastActionBar(); }
     function viewDiff() { vscode.postMessage({ type: 'viewDiff' }); }
+    function executePlan() { vscode.postMessage({ type: 'executePlan' }); removeLastActionBar(); }
 
     function autoFix() {
       if (lastFailedOutput) {
@@ -818,6 +977,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case 'result': addResultCard(msg.status, msg.title, msg.detail, msg.stdout, msg.stderr, msg.exitCode, msg.durationMs, msg.command); break;
         case 'command': addCommandCard(msg.command, msg.description, msg.cwd); break;
         case 'edit': addEditCard(msg.filePath, msg.instruction, msg.changes); break;
+        case 'plan': addPlanCard(msg.steps); break;
       }
     });
   </script>

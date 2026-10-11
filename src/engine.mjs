@@ -156,6 +156,34 @@ rl.on('line', async (line) => {
       result = await inspectFilmProject(request.params?.path || '.');
     } else if (request.method === 'pack.film.verify') {
       result = await verifyMediaLinks(request.params?.path || '.');
+    } else if (request.method === 'workspace.detectLanguage') {
+      const { path: workspacePath } = request.params || {};
+      const { detectLanguageAndFramework } = await import('./lib/language-detector.mjs');
+      result = await detectLanguageAndFramework(workspacePath || process.cwd());
+    } else if (request.method === 'workspace.resolveCommand') {
+      const { intent, workspacePath } = request.params || {};
+      if (!intent) throw new Error('Missing intent');
+
+      const { detectLanguageAndFramework } = await import('./lib/language-detector.mjs');
+      const { resolveCommand } = await import('./lib/command-resolver.mjs');
+
+      const detection = await detectLanguageAndFramework(workspacePath || process.cwd());
+      const resolved = resolveCommand(intent, detection);
+
+      if (!resolved) {
+        result = {
+          success: false,
+          message: `Could not resolve command for intent: "${intent}". Detected ecosystem: ${detection.primaryEcosystem || 'unknown'}.`
+        };
+      } else {
+        result = {
+          success: true,
+          command: resolved.command,
+          args: resolved.args,
+          description: resolved.description,
+          detectedEcosystem: detection.primaryEcosystem
+        };
+      }
     } else if (request.method === 'pack.film.applyPatch') {
       result = await applyFilmPatch(
         request.params?.path || '.',
@@ -165,10 +193,8 @@ rl.on('line', async (line) => {
     } else if (request.method === 'pack.film.fix') {
       const { path: projectPath } = request.params || {};
       const { inspectFilmProject } = await import('../packs/film/dist/index.js');
-      const { readFile, readdir } = await import('node:fs/promises');
       const pathModule = await import('node:path');
 
-      // 1. Inspect the project to find missing and available media
       const report = await inspectFilmProject(projectPath || '.');
       const allClips = report.clips || [];
       const missingClips = allClips.filter(c => !c.mediaExists && c.source === 'timeline');
@@ -177,11 +203,9 @@ rl.on('line', async (line) => {
       if (missingClips.length === 0) {
         result = { missingClips: [], proposedRelsinks: [], timelinePath: null };
       } else {
-        // 2. Find the EDL timeline path
         const edlTimeline = report.timelines.find(t => t.format === 'edl');
         const timelinePath = edlTimeline ? pathModule.join(projectPath || '.', edlTimeline.path) : null;
 
-        // 3. Use LLM to propose relinks
         const { provider, model } = selectModelProvider();
         const router = new CapabilityRouter([provider]);
         await router.refreshModels();
@@ -208,7 +232,6 @@ rl.on('line', async (line) => {
         if (cleaned.startsWith('```json')) cleaned = cleaned.replace(/^```json\s*/, '').replace(/\s*```$/, '');
         else if (cleaned.startsWith('```')) cleaned = cleaned.replace(/^```\s*/, '').replace(/\s*```$/, '');
 
-        // Extract JSON array
         const firstBracket = cleaned.indexOf('[');
         const lastBracket = cleaned.lastIndexOf(']');
         if (firstBracket !== -1 && lastBracket > firstBracket) {
@@ -228,7 +251,6 @@ rl.on('line', async (line) => {
           timelinePath,
         };
       }
-
     } else if (request.method === 'pack.film.applyFix') {
       const { path: projectPath, timelinePath, relinks } = request.params || {};
       const { readFile, writeFile } = await import('node:fs/promises');
@@ -238,14 +260,10 @@ rl.on('line', async (line) => {
         throw new Error('Missing timelinePath or relinks');
       }
 
-      // 1. Read the EDL file
       let edlContent = await readFile(timelinePath, 'utf8');
-
-      // 2. Create backup
       const backupPath = timelinePath + '.bak';
       await writeFile(backupPath, edlContent, 'utf8');
 
-      // 3. Apply relinks
       let fixedCount = 0;
       for (const relink of relinks) {
         if (edlContent.includes(relink.missingFile)) {
@@ -254,16 +272,13 @@ rl.on('line', async (line) => {
         }
       }
 
-      // 4. Write the fixed EDL
       await writeFile(timelinePath, edlContent, 'utf8');
 
-      // 5. Verify by re-inspecting
       const verifyReport = await inspectFilmProject(projectPath || '.');
       const stillMissing = (verifyReport.clips || []).filter(c => !c.mediaExists && c.source === 'timeline');
 
       if (stillMissing.length > 0) {
-        // Verification failed - revert
-        await writeFile(timelinePath, edlContent, 'utf8');
+        await writeFile(timelinePath, await readFile(backupPath, 'utf8'), 'utf8');
         result = {
           success: false,
           fixedCount,
@@ -278,8 +293,7 @@ rl.on('line', async (line) => {
           reverted: false,
         };
       }
-    }
-    else if (request.method === 'chat.run') {
+    } else if (request.method === 'chat.run') {
       const { command, args, cwd } = request.params || {};
       if (!command) throw new Error('Missing command');
 
@@ -302,30 +316,30 @@ rl.on('line', async (line) => {
       const router = new CapabilityRouter([provider]);
       await router.refreshModels();
 
-      // Strip ANSI color codes for better LLM comprehension
       const rawOutput = ((stderr || '') + '\n' + (stdout || '')).replace(/\x1b\[[0-9;]*m/g, '');
       const errorText = rawOutput.slice(-4000);
 
-      const system = 'You are an expert debugger. A terminal command failed. Look at the error message and the code snippet provided. ' +
-        'Identify the EXACT syntax error (like a missing bracket, typo, or wrong import). ' +
-        'Output ONLY a valid JSON object like: {"filePath": "src/foo.js", "instruction": "Add the missing opening curly brace { on line 7 after the function declaration"}. ' +
-        'Do NOT suggest deleting the code. Fix the root cause. ' +
-        'If you cannot identify a specific file to fix, return {"filePath": null, "instruction": "Reason why you cannot fix it"}.';
+      const system = 'You are an expert autonomous debugger. A terminal command failed. ' +
+        'Analyze the error output and determine the exact steps required to fix it. ' +
+        'You MUST output a valid JSON object with an "actions" array detailing the steps to execute. ' +
+        'Format: {"actions": [{"type": "run", "command": "npm", "args": ["install", "--save-dev", "ts-jest"]}, {"type": "edit", "filePath": "jest.config.js", "instruction": "add ts-jest"}]}\n' +
+        'If the error is a Jest/TypeScript parsing error in a .ts file, and the project is not configured for TS tests, the best fix is to delete the .ts file and recreate it as a .js file with identical logic, OR install ts-jest and configure it. Choose the simplest path.\n' +
+        'If a dependency is missing, use a "run" action to install it.\n' +
+        'Output ONLY the JSON object. No markdown, no extra text.';
 
       const user = 'Command: ' + command + '\n\nError Output:\n' + errorText;
 
       const response = await provider.complete({
-        modelId: model || 'qwen2.5:3b',
+        modelId: model || 'qwen/qwen-2.5-72b-instruct', // Upgrade to 72B for better debugging
         messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
         temperature: 0.1,
-        maxOutputTokens: 256,
+        maxOutputTokens: 512,
       });
 
       let cleaned = response.content.trim();
       if (cleaned.startsWith('```json')) cleaned = cleaned.replace(/^```json\s*/, '').replace(/\s*```$/, '');
       else if (cleaned.startsWith('```')) cleaned = cleaned.replace(/^```\s*/, '').replace(/\s*```$/, '');
 
-      // RESILIENT JSON PARSING: Extract just the {...} object, ignoring trailing garbage like ";}"
       const firstBrace = cleaned.indexOf('{');
       const lastBrace = cleaned.lastIndexOf('}');
       if (firstBrace !== -1 && lastBrace > firstBrace) {
@@ -335,7 +349,7 @@ rl.on('line', async (line) => {
       try {
         result = JSON.parse(cleaned);
       } catch (e) {
-        result = { filePath: null, instruction: 'Failed to parse diagnosis: ' + cleaned };
+        result = { actions: [], fallbackInstruction: 'Failed to parse diagnosis: ' + cleaned };
       }
 
     } else if (request.method === 'chat.edit') {
@@ -346,21 +360,17 @@ rl.on('line', async (line) => {
       const router = new CapabilityRouter([provider]);
       await router.refreshModels();
 
-      const systemContent = `You are an expert code editor. Your job is to fix errors in code.
-You MUST output the changes using the SEARCH/REPLACE block format.
-Do NOT output the entire file. Only output the exact lines that need to change.
-
-Format:
-<<<<<<< SEARCH
-[exact original code to find, character-for-character]
-=======
-[new code to replace it with]
->>>>>>> REPLACE
-
-Rules:
-1. The SEARCH block must EXACTLY match a contiguous block of code in the original file. Include enough context (surrounding lines) to make it unique.
-2. Output ONLY the SEARCH/REPLACE block(s). No explanations, no markdown code fences.
-3. If you need to add a missing bracket, include the line above it in the SEARCH block.`;
+      const systemContent = 'You are an expert code-editing AI. You must output ONLY a SEARCH/REPLACE block to modify the given file. ' +
+        'Do NOT output any explanations, greetings, or markdown formatting outside the block. ' +
+        'Use the exact following format:\n' +
+        '<<<<<<< SEARCH\n' +
+        '[exact lines to find in the original file]\n' +
+        '=======\n' +
+        '[new lines to replace them with]\n' +
+        '>>>>>>> REPLACE\n' +
+        'If you need to add new code, search for the surrounding lines and replace them with those same lines plus the new code.\n' +
+        'If the file is empty, use an empty SEARCH block.\n' +
+        'Output ONLY the SEARCH/REPLACE block. No other text.';
 
       const userContent = 'FILE PATH: ' + filePath +
         '\n\nINSTRUCTION: ' + instruction +
@@ -385,15 +395,32 @@ Rules:
       let editedContent = fileContent || '';
       let appliedCount = 0;
 
-      // Helper function to apply a search/replace pair with fuzzy matching
+      // PRODUCTION SANITIZATION: Strip accidental wrapping artifacts from LLM output
+      const sanitizeOutput = (text) => {
+        let cleaned = text.trim();
+        // Remove accidental leading/trailing brackets (common LLM mistake)
+        if (cleaned.startsWith('[') && !cleaned.includes('module.exports')) {
+          cleaned = cleaned.replace(/^\[\s*/, '');
+        }
+        if (cleaned.endsWith(']') && !cleaned.includes('module.exports')) {
+          cleaned = cleaned.replace(/\s*\]$/, '');
+        }
+        // Remove accidental JSON wrapping
+        if (cleaned.startsWith('{') && cleaned.includes('"content"')) {
+          try {
+            const parsed = JSON.parse(cleaned);
+            if (parsed.content) cleaned = parsed.content;
+          } catch { /* not JSON, leave as is */ }
+        }
+        return cleaned;
+      };
+
       const applyPatch = (searchBlock, replaceBlock) => {
-        // 1. Try exact match first
         if (editedContent.includes(searchBlock)) {
           editedContent = editedContent.replace(searchBlock, replaceBlock);
           appliedCount++;
           return true;
         }
-        // 2. Fuzzy match fallback (crucial for 3B models that mess up indentation)
         const searchLines = searchBlock.split('\n').map((l) => l.trim()).filter((l) => l);
         if (searchLines.length === 0) return false;
 
@@ -417,14 +444,12 @@ Rules:
         return false;
       };
 
-      // FORMAT 1: Strict Aider/Cursor format
       const strictRegex = /<<<<<<< SEARCH\n([\s\S]*?)\n?=======\n([\s\S]*?)\n?>>>>>>> REPLACE/g;
       let match;
       while ((match = strictRegex.exec(rawOutput)) !== null) {
         applyPatch(match[1], match[2]);
       }
 
-      // FORMAT 2: Simple SEARCH/REPLACE (common for small 3B models)
       if (appliedCount === 0) {
         process.stderr.write('[engine] Strict format not found. Trying simple SEARCH/REPLACE format...\n');
         const simpleRegex = /SEARCH:\s*\n([\s\S]*?)\nREPLACE:\s*\n([\s\S]*?)(?=\nSEARCH:|$)/gi;
@@ -437,10 +462,55 @@ Rules:
         throw new Error('Failed to apply changes. The model did not output a recognizable SEARCH/REPLACE block. Raw output:\n' + rawOutput.slice(0, 500));
       }
 
+      // NUCLEAR SANITIZATION: Force strip any LLM wrapping artifacts before saving
+      let finalContent = editedContent;
+      if (typeof finalContent === 'string') {
+        finalContent = finalContent.trim();
+        // Strip accidental array wrapping: [code]
+        if (finalContent.startsWith('[') && finalContent.endsWith(']')) {
+          try { JSON.parse(finalContent); } catch {
+            finalContent = finalContent.substring(1, finalContent.length - 1).trim();
+          }
+        }
+        // Strip accidental JSON object wrapping: {"content": "code"}
+        if (finalContent.startsWith('{') && finalContent.endsWith('}')) {
+          try {
+            const parsed = JSON.parse(finalContent);
+            if (typeof parsed.content === 'string') finalContent = parsed.content;
+          } catch {}
+        }
+        // Strip accidental markdown code blocks that slipped through
+        if (finalContent.startsWith('```typescript')) finalContent = finalContent.replace(/^```typescript\n?/, '');
+        else if (finalContent.startsWith('```ts')) finalContent = finalContent.replace(/^```ts\n?/, '');
+        else if (finalContent.startsWith('```javascript')) finalContent = finalContent.replace(/^```javascript\n?/, '');
+        else if (finalContent.startsWith('```js')) finalContent = finalContent.replace(/^```js\n?/, '');
+        else if (finalContent.startsWith('```')) finalContent = finalContent.replace(/^```\n?/, '');
+        if (finalContent.endsWith('```')) finalContent = finalContent.replace(/\n?```$/, '');
+
+        finalContent = finalContent.trim();
+      }
+
+      // AUTO-REPAIR package.json: Strip trailing commas before saving to prevent JSONParseError
+      if (filePath.endsWith('package.json') && typeof finalContent === 'string') {
+        try {
+          JSON.parse(finalContent);
+        } catch (e) {
+          // Regex to remove trailing commas before } or ]
+          let repaired = finalContent.replace(/,\s*([\]}])/g, '$1');
+          try {
+            JSON.parse(repaired);
+            finalContent = repaired;
+            process.stderr.write('[engine] Auto-repaired invalid JSON (trailing comma) in package.json\n');
+          } catch (e2) {
+            process.stderr.write('[engine] CRITICAL: Could not auto-repair package.json: ' + e2.message + '\n');
+          }
+        }
+      }
+
       result = {
         filePath: filePath,
         originalContent: fileContent || '',
-        editedContent: editedContent,
+        editedContent: finalContent,
         instruction: instruction,
         modelUsed: model || 'unknown',
       };
@@ -452,38 +522,163 @@ Rules:
       const router = new CapabilityRouter([provider]);
       await router.refreshModels();
 
-      const historyText =
-        history && history.length > 0
-          ? history.map((h) => h.role + ': ' + h.content).join('\n')
-          : '';
+      const historyText = history && history.length > 0
+        ? history.map((h) => h.role + ': ' + h.content).join('\n')
+        : '';
 
-      const systemContent =
-        'You are Junub Agent, an expert software engineer working inside a VS Code workspace. ' +
-        'You have access to the workspace structure and files provided below. ' +
-        'Answer the user question accurately using ONLY the real files and context provided. ' +
-        'Never hallucinate file paths or invent files that do not exist. ' +
-        'If you reference a file, use its exact path from the workspace context. ' +
-        'Be specific, technical, and concise. Use markdown formatting for readability.';
+      let frameworkContext = '';
+      if (workspaceContext && workspaceContext.includes('Frameworks:')) {
+        const frameworksMatch = workspaceContext.match(/Frameworks:\s*([^\n]+)/);
+        if (frameworksMatch && frameworksMatch[1]) {
+          const frameworks = frameworksMatch[1].split(',').map(f => f.trim());
+          const { generateFrameworkContext } = await import('./lib/framework-prompts.mjs');
+          frameworkContext = generateFrameworkContext(frameworks);
+        }
+      }
+
+                  const systemContent = '*** MANDATORY PRE-FLIGHT ENVIRONMENT CHECK ***\n' +
+        'Before generating ANY action plan, you MUST analyze the workspace context provided below.\n' +
+        'If the user asks to ADD, CREATE, or IMPLEMENT tests, you MUST verify the following in the context:\n' +
+        '1. Is the test runner (jest, vitest, pytest) installed in package.json dependencies? If NO, your FIRST action MUST be to install it.\n' +
+        '2. Does the "test" script exist in package.json scripts? If NO, your SECOND action MUST be to add it.\n' +
+        '3. If the project uses TypeScript (has tsconfig.json or .ts files), is ts-jest installed and configured? If NO, you MUST install ts-jest and create jest.config.js BEFORE creating the test file.\n' +
+        'NEVER assume the testing environment is already set up. You must explicitly plan the setup steps if they are missing from the context.\n\n' +
+        '*** PROFESSIONAL CODE GENERATION RULES ***\n' +
+        '1. SELF-CONTAINED TESTS: If you create a test file that tests local logic, you MUST either include an edit action to create the source file, OR define the functions directly inside the test file. NEVER import a non-existent local file.\n' +
+        '2. ANTI-HALLUCINATION: NEVER run "npm install" to fix a "Cannot find module" error for a relative path (starts with "./" or "../"). Relative paths are local files. Create them instead.\n\n' +
+        'You are Junub Agent, an autonomous software engineering agent. ' +
+        '- CRITICAL RULE FOR TEST SCRIPTS: When adding or editing the "test" script in package.json, you MUST use exactly "test": "jest" (or "vitest", "pytest", etc.). NEVER add "--watch", "--watchAll", or "--watchman" to the test script. Watch modes cause the automated runner to hang and timeout.\n' +
+
+        'CRITICAL RULE: If the user asks you to implement, create, fix, apply, or do something, ' +
+        'you MUST NOT just give text instructions. You MUST output a valid JSON object ' +
+        'with an "actions" array detailing the exact steps to execute. ' +
+        'Format your response EXACTLY like this JSON (no markdown, no extra text):\n' +
+        '{\n' +
+        '  "actions": [\n' +
+        '    {"type": "edit", "filePath": "package.json", "instruction": "Add a test script using jest"},\n' +
+        '    {"type": "run", "command": "npm", "args": ["install", "--save-dev", "jest"]},\n' +
+        '    {"type": "edit", "filePath": "__tests__/sample.test.js", "instruction": "Create a basic sample test file that passes"},\n' +
+        '    {"type": "run", "command": "npm", "args": ["test"]}\n' +
+        '  ]\n' +
+        '}\n' +
+        'IMPORTANT RULES:\n' +
+        '- NEVER hallucinate file paths. Use ONLY the files and frameworks listed in the workspace context.\n' +
+        '- If the user is just asking a general question and no file edits or commands are needed, respond with normal text.\n' +
+        (frameworkContext ? '\n\nFRAMEWORK-SPECIFIC RULES:\n' + frameworkContext : '');
+
+      // DETERMINISTIC PRE-FLIGHT ENVIRONMENT CHECK (Engine-level, not LLM-reliant)
+      let preFlightDirectives = '';
+      if (workspaceContext && message.toLowerCase().includes('test')) {
+        const hasJest = workspaceContext.includes('jest') || workspaceContext.includes('vitest');
+        const isTypeScript = workspaceContext.toLowerCase().includes('typescript') || workspaceContext.includes('.ts');
+        const hasTestScript = workspaceContext.includes('\"test\"');
+
+        if (!hasJest) {
+          preFlightDirectives += '\n\n*** SYSTEM PRE-FLIGHT ALERT ***: The project does NOT have a test runner installed. Your plan MUST include an action to install jest (and ts-jest + @types/jest if it is a TypeScript project).\n';
+        }
+        if (isTypeScript && !workspaceContext.includes('ts-jest')) {
+          preFlightDirectives += '\n*** SYSTEM PRE-FLIGHT ALERT ***: The project uses TypeScript but ts-jest is NOT installed. Your plan MUST include an action to install ts-jest AND create jest.config.js with the ts-jest preset BEFORE creating any .ts test files.\n';
+        }
+        if (!hasTestScript) {
+          preFlightDirectives += '\n*** SYSTEM PRE-FLIGHT ALERT ***: The package.json "test" script is missing. Your plan MUST include an action to add "test": "jest" to the scripts.\n';
+        }
+      }
+
+      // AGGRESSIVE DETERMINISTIC PRE-FLIGHT CHECK
+      let systemDirective = '';
+      const lowerMsg = message.toLowerCase();
+      if (workspaceContext && (lowerMsg.includes('test') || lowerMsg.includes('testing'))) {
+        const isTypeScript = workspaceContext.includes('typescript') || workspaceContext.includes('tsconfig.json');
+        const hasTsJest = workspaceContext.includes('ts-jest');
+        const hasJestConfig = workspaceContext.includes('jest.config');
+        const hasTestScript = /\"test\"\s*:\s*\"jest\"/.test(workspaceContext) || /\"test\"\s*:\s*\"vitest\"/.test(workspaceContext);
+
+        let missing = [];
+        if (!workspaceContext.includes('jest') && !workspaceContext.includes('vitest')) {
+           missing.push('Run: npm install --save-dev jest');
+        }
+        if (isTypeScript && !hasTsJest) {
+           missing.push('Run: npm install --save-dev ts-jest @types/jest');
+        }
+        if (isTypeScript && !hasJestConfig) {
+           missing.push('Create jest.config.js with: module.exports = { preset: "ts-jest", testEnvironment: "node" };');
+        }
+        if (!hasTestScript) {
+           missing.push('Add "test": "jest" to package.json scripts');
+        }
+
+        if (missing.length > 0) {
+           systemDirective = '\n\n[SYSTEM DIRECTIVE - MANDATORY COMPLIANCE]\n' +
+             'The workspace is missing critical testing infrastructure. Your "actions" array MUST include these setup steps FIRST, before creating any test files:\n' +
+             missing.map((m, i) => (i + 1) + '. ' + m).join('\n') +
+             '\nDo NOT skip these steps. The environment MUST be fully configured in your plan.';
+        }
+      }
 
       const userContent =
         'WORKSPACE CONTEXT:\n' +
         (workspaceContext || 'No workspace open.') +
         '\n\nCONVERSATION HISTORY:\n' +
         (historyText || 'No previous messages.') +
-        '\n\nUSER QUESTION:\n' +
-        message;
+        '\n\nUSER REQUEST:\n' +
+        message + systemDirective;
 
       const response = await provider.complete({
-        modelId: model || 'qwen2.5:3b',
+        modelId: model || 'qwen/qwen-2.5-72b-instruct',
         messages: [
           { role: 'system', content: systemContent },
           { role: 'user', content: userContent },
         ],
-        temperature: 0.2,
+        temperature: 0.1,
         maxOutputTokens: 2048,
       });
 
-      result = { response: response.content, modelUsed: model || 'unknown' };
+      let responseText = response.content.trim();
+      if (responseText.startsWith('```json')) responseText = responseText.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+      else if (responseText.startsWith('```')) responseText = responseText.replace(/^```\s*/, '').replace(/\s*```$/, '');
+
+      let isActionPlan = false;
+      try {
+        const firstBrace = responseText.indexOf('{');
+        const lastBrace = responseText.lastIndexOf('}');
+        if (firstBrace !== -1 && lastBrace > firstBrace) {
+          const jsonStr = responseText.substring(firstBrace, lastBrace + 1);
+          const parsed = JSON.parse(jsonStr);
+          if (parsed.actions && Array.isArray(parsed.actions)) {
+            // SYSTEM-LEVEL PLAN INJECTION (Auto-inject missing setup steps)
+            const hasInstall = parsed.actions.some(a => a.type === 'run' && a.args && a.args.some(arg => arg.includes('jest') || arg.includes('vitest')));
+            const hasTsJest = parsed.actions.some(a => a.type === 'run' && a.args && a.args.some(arg => arg.includes('ts-jest')));
+            const isTypeScript = workspaceContext && (workspaceContext.toLowerCase().includes('typescript') || workspaceContext.includes('.ts'));
+            const hasJestConfig = parsed.actions.some(a => a.type === 'edit' && a.filePath.includes('jest.config'));
+
+            let injectedSteps = [];
+
+            if (isTypeScript && !hasTsJest) {
+              injectedSteps.push({ type: 'run', command: 'npm', args: ['install', '--save-dev', 'jest', 'ts-jest', '@types/jest'] });
+            } else if (!hasInstall) {
+              injectedSteps.push({ type: 'run', command: 'npm', args: ['install', '--save-dev', 'jest'] });
+            }
+
+            if (isTypeScript && !hasJestConfig) {
+              injectedSteps.push({ type: 'edit', filePath: 'jest.config.js', instruction: 'Create jest config with ts-jest preset' });
+            }
+
+            if (injectedSteps.length > 0) {
+              parsed.actions = [...injectedSteps, ...parsed.actions];
+              process.stderr.write('[engine] Auto-injected ' + injectedSteps.length + ' missing environment setup steps into the plan.\n');
+            }
+
+            isActionPlan = true;
+            result = { isActionPlan: true, actions: parsed.actions, modelUsed: model || 'unknown' };
+          }
+        }
+      } catch (e) {
+        process.stderr.write('[engine] chat.query JSON parse failed, falling back to text: ' + e.message + '\n');
+      }
+
+      if (!isActionPlan) {
+        result = { isActionPlan: false, response: responseText, modelUsed: model || 'unknown' };
+      }
     } else if (request.method === 'task.refine') {
       const { message, history, workspaceContext } = request.params || {};
       if (!message) throw new Error('Missing message for refinement');
@@ -605,7 +800,18 @@ If the request is too vague even with context, output this EXACT structure:
     }
   } catch (err) {
     success = false;
-    errorPayload = { code: err.code || 'UNKNOWN_ERROR', message: err.message };
+    let errorMessage = err.message || 'Unknown error';
+
+    if (errorMessage.includes('429') || errorMessage.includes('rate-limited') || errorMessage.includes('engine_overloaded')) {
+      errorMessage = 'Rate limit reached. The free OpenRouter shared pool is currently overloaded. ' +
+        'Please wait a moment and try again, or configure your own OpenRouter API key in VS Code settings (junubAgent.dashscopeApiKey) for dedicated, higher limits.';
+    }
+
+    if (errorMessage.includes('fetch failed') || errorMessage.includes('ENOTFOUND') || errorMessage.includes('ECONNREFUSED')) {
+      errorMessage = 'Network error. Unable to reach the AI provider. Please check your internet connection or verify that your local Ollama server is running if using local models.';
+    }
+
+    errorPayload = { code: err.code || 'UNKNOWN_ERROR', message: errorMessage };
   }
 
   process.stdout.write(

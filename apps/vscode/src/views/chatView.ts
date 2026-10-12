@@ -4,6 +4,152 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { EngineTransport } from '../transport.js';
 
+// -------------------------------------------------------------------------
+// Enterprise-Grade Intelligent Error Classification (Pillar 4)
+// -------------------------------------------------------------------------
+type ErrorClassification =
+  | { type: 'missing_local_file'; filePath: string; confidence: number }
+  | { type: 'missing_dependency'; packageName: string; confidence: number }
+  | { type: 'syntax_error'; filePath: string; line: number; column: number; message: string; confidence: number }
+  | { type: 'port_in_use'; port: number; confidence: number }
+  | { type: 'permission_denied'; filePath: string; confidence: number }
+  | { type: 'out_of_memory'; confidence: number }
+  | { type: 'network_error'; message: string; confidence: number }
+  | { type: 'command_not_found'; command: string; confidence: number }
+  | { type: 'git_conflict'; filePath: string; confidence: number }
+  | { type: 'unknown'; confidence: number };
+
+function classifyError(command: string, stdout: string, stderr: string): ErrorClassification {
+  const rawOutput = (stdout + '\n' + stderr).replace(/\x1b\[[0-9;]*m/g, '').replace(/\r\n/g, '\n');
+
+  const extractLocation = (text: string): { filePath: string; line: number; col: number } | null => {
+    const match = text.match(/([a-zA-Z]:\\[^:\n]+|\/[^:\n]+|[a-zA-Z0-9_\-\/\.]+\.(?:ts|tsx|js|jsx|mjs|cjs|json)):(\d+):(\d+)/);
+    if (match && match[1] && match[2] && match[3]) {
+      return { filePath: match[1].trim(), line: parseInt(match[2], 10), col: parseInt(match[3], 10) };
+    }
+    return null;
+  };
+
+  if (/JavaScript heap out of memory|FATAL ERROR:.*heap limit|Allocation failed/.test(rawOutput)) {
+    return { type: 'out_of_memory', confidence: 0.99 };
+  }
+
+  const portMatch = rawOutput.match(/EADDRINUSE.*?(\d{2,5})/i) || rawOutput.match(/port (\d+) is already in use/i);
+  if (portMatch && portMatch[1]) {
+    return { type: 'port_in_use', port: parseInt(portMatch[1], 10), confidence: 0.95 };
+  }
+
+  const cmdNotFoundMatch = rawOutput.match(/'([^']+)' is not recognized as an internal or external command/i) ||
+    rawOutput.match(/command not found:\s*([^\s\n]+)/i) ||
+    rawOutput.match(/spawn\s+([^\s]+)\s+ENOENT/i);
+  if (cmdNotFoundMatch && cmdNotFoundMatch[1]) {
+    return { type: 'command_not_found', command: cmdNotFoundMatch[1].trim(), confidence: 0.9 };
+  }
+
+  const permMatch = rawOutput.match(/EACCES: permission denied,\s*(?:open|scandir|mkdir)\s+'([^']+)'/i) ||
+    rawOutput.match(/EPERM:\s*operation not permitted,\s*(?:open|scandir|mkdir)\s+'([^']+)'/i);
+  if (permMatch && permMatch[1]) {
+    return { type: 'permission_denied', filePath: permMatch[1].trim(), confidence: 0.95 };
+  }
+
+  const netMatch = rawOutput.match(/(ENOTFOUND|ETIMEDOUT|ECONNREFUSED|CERT_UNTRUSTED)/);
+  if (netMatch && netMatch[1]) {
+    return { type: 'network_error', message: `Network failure: ${netMatch[1]}. Check internet or npm registry.`, confidence: 0.9 };
+  }
+
+  if (rawOutput.includes('<<<<<<< HEAD') || rawOutput.includes('<<<<<<<')) {
+    const conflictFile = rawOutput.match(/Merge conflict in ([^\n]+)/i)?.[1]?.trim() || 'unknown file';
+    return { type: 'git_conflict', filePath: conflictFile, confidence: 0.95 };
+  }
+
+  const moduleMatch = rawOutput.match(/Cannot find module '([^']+)' from '([^']+)'/i) ||
+    rawOutput.match(/Module not found: Error: Can't resolve '([^']+)' in '([^']+)'/i) ||
+    rawOutput.match(/Cannot find package '([^']+)' from '([^']+)'/i) ||
+    rawOutput.match(/TS2307: Cannot find module '([^']+)'/i);
+
+  if (moduleMatch && moduleMatch[1]) {
+    const requested = moduleMatch[1].trim();
+    const importingFile = moduleMatch[2]?.trim();
+
+    if (requested.startsWith('.') || requested.startsWith('/') || requested.includes('/') || requested.includes('\\')) {
+      let targetFile = requested;
+
+      // If we have the importing file, resolve the relative path properly
+      if (importingFile && requested.startsWith('.')) {
+        const importingDir = path.dirname(importingFile);
+        targetFile = path.posix.join(importingDir, requested);
+        // Normalize the path (remove ./ and resolve ../)
+        targetFile = path.posix.normalize(targetFile);
+      } else {
+        // Fallback: just strip the leading ./ or ../
+        targetFile = requested.replace(/^\.\//, '').replace(/^\.\.\//, '').replace(/^\.\.\\/, '');
+      }
+
+      if (!targetFile.includes('.')) {
+        targetFile += '.ts';
+      }
+      return { type: 'missing_local_file', filePath: targetFile, confidence: 0.95 };
+    }
+
+    let packageName = requested;
+    if (requested.startsWith('@')) {
+      const parts = requested.split('/');
+      const scope = parts[0];
+      const pkg = parts[1];
+      if (scope && pkg) packageName = scope + '/' + pkg;
+    } else {
+      const parts = requested.split('/');
+      const firstPart = parts[0];
+      if (firstPart) packageName = firstPart;
+    }
+
+    return { type: 'missing_dependency', packageName: packageName, confidence: 0.9 };
+  }
+
+  const syntaxMatch = rawOutput.match(/(?:SyntaxError|TS\d+):\s*([^\n]+)\n\s*(?:at\s+)?(?:.*?\()?(.*?\.(?:ts|tsx|js|jsx|mjs|cjs|json)):(\d+):(\d+)/i);
+  if (syntaxMatch && syntaxMatch[1] && syntaxMatch[2] && syntaxMatch[3] && syntaxMatch[4]) {
+    return {
+      type: 'syntax_error',
+      filePath: syntaxMatch[2].trim(),
+      line: parseInt(syntaxMatch[3], 10),
+      column: parseInt(syntaxMatch[4], 10),
+      message: syntaxMatch[1].trim(),
+      confidence: 0.9
+    };
+  }
+
+  const fallbackSyntax = rawOutput.match(/(?:SyntaxError|TS\d+):\s*([^\n]+)/i);
+  if (fallbackSyntax && fallbackSyntax[1]) {
+    const loc = extractLocation(rawOutput);
+    if (loc) {
+      return {
+        type: 'syntax_error',
+        filePath: loc.filePath,
+        line: loc.line,
+        column: loc.col,
+        message: fallbackSyntax[1].trim(),
+        confidence: 0.8
+      };
+    }
+  }
+
+  if (/Unexpected token|JSONParseError|Unexpected end of JSON input/i.test(rawOutput)) {
+    const loc = extractLocation(rawOutput);
+    if (loc && (loc.filePath.endsWith('.json') || loc.filePath.includes('package') || loc.filePath.includes('tsconfig'))) {
+      return {
+        type: 'syntax_error',
+        filePath: loc.filePath,
+        line: loc.line,
+        column: loc.col,
+        message: 'Invalid JSON syntax (e.g., trailing comma, missing quote)',
+        confidence: 0.95
+      };
+    }
+  }
+
+  return { type: 'unknown', confidence: 0 };
+}
+
 interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
@@ -33,6 +179,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private pendingFailedCommand: string | null = null;
   private pendingFilmFix: { path: string; timelinePath: string; relinks: any[] } | null = null;
   private pendingActionPlan: any[] | null = null;
+  private autoFixRetryCount: number = 0;
+  private lastFailedCommand: string | null = null;
+  private lastFailedStdout: string | null = null;
+  private lastFailedStderr: string | null = null;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -69,6 +219,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         await this._executePendingCommand();
       } else if (data.type === 'rejectCommand') {
         this.pendingCommand = null;
+        this.autoFixRetryCount = 0;
         this._postMessage({ type: 'result', status: 'rejected', title: 'Command Cancelled', detail: 'No command was executed.' });
       } else if (data.type === 'autoFix') {
         await this._handleAutoFix(data.command, data.stdout, data.stderr);
@@ -78,9 +229,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  // -------------------------------------------------------------------------
-  // Workspace Context (RAG)
-  // -------------------------------------------------------------------------
   private async _readWorkspaceContext(): Promise<string> {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!workspaceFolder) return 'No workspace open.';
@@ -105,7 +253,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (pkg.scripts) parts.push('Scripts: ' + Object.keys(pkg.scripts).join(', '));
       } catch { /* no package.json */ }
 
-      // UNIVERSAL LANGUAGE DETECTION
       try {
         const detection = await this.transport.request('workspace.detectLanguage', { path: workspaceFolder }) as any;
         if (detection.languages && detection.languages.length > 0) {
@@ -127,18 +274,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
       } catch { /* detection failed silently */ }
 
-      try {
-        const srcTree = await this._listDir(path.join(workspaceFolder, 'src'), '', 2);
-        if (srcTree) parts.push('\nsrc/ structure:\n' + srcTree);
-      } catch { /* no src dir */ }
-      try {
-        const pkgTree = await this._listDir(path.join(workspaceFolder, 'packages'), '', 2);
-        if (pkgTree) parts.push('\npackages/ structure:\n' + pkgTree);
-      } catch { /* no packages dir */ }
-      try {
-        const appTree = await this._listDir(path.join(workspaceFolder, 'apps'), '', 2);
-        if (appTree) parts.push('\napps/ structure:\n' + appTree);
-      } catch { /* no apps dir */ }
+      for (const dir of ['src', 'packages', 'apps']) {
+        try {
+          const tree = await this._listDir(path.join(workspaceFolder, dir), '', 2);
+          if (tree) parts.push(`\n${dir}/ structure:\n` + tree);
+        } catch { }
+      }
     } catch (e: any) {
       parts.push('Error reading workspace: ' + e.message);
     }
@@ -166,9 +307,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } catch { return ''; }
   }
 
-  // -------------------------------------------------------------------------
-  // Intent Parsing (Universal Command Routing)
-  // -------------------------------------------------------------------------
   private async _parseCommandRequest(message: string): Promise<{ command: string; args: string[]; description: string } | null> {
     const lower = message.toLowerCase();
     if (!lower.startsWith('run ') && !lower.startsWith('execute ') && !lower.startsWith('start ')) {
@@ -177,10 +315,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!workspaceFolder) {
-      const cmdStr = message.replace(/^(run|execute|start)\s+/i, '').trim();
-      const parts = cmdStr.split(/\s+/).filter(p => p.length > 0);
-      if (parts.length === 0) return null;
-      return { command: parts[0]!, args: parts.slice(1), description: 'Run: ' + cmdStr };
+      const parts = message.replace(/^(run|execute|start)\s+/i, '').trim().split(/\s+/).filter(p => p.length > 0);
+      return parts.length === 0 ? null : { command: parts[0]!, args: parts.slice(1), description: 'Run: ' + parts.join(' ') };
     }
 
     try {
@@ -200,10 +336,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.outputChannel.appendLine('[Chat] Command resolution failed: ' + (e as Error).message);
     }
 
-    const cmdStr = message.replace(/^(run|execute|start)\s+/i, '').trim();
-    const parts = cmdStr.split(/\s+/).filter(p => p.length > 0);
-    if (parts.length === 0) return null;
-    return { command: parts[0]!, args: parts.slice(1), description: 'Run generic command: ' + cmdStr };
+    const parts = message.replace(/^(run|execute|start)\s+/i, '').trim().split(/\s+/).filter(p => p.length > 0);
+    return parts.length === 0 ? null : { command: parts[0]!, args: parts.slice(1), description: 'Run generic command: ' + parts.join(' ') };
   }
 
   private _parseEditRequest(message: string): { filePath: string; instruction: string } | null {
@@ -222,23 +356,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private _parseDomainRequest(message: string): { domain: string; action: string; path: string } | null {
     const lower = message.toLowerCase();
-
     if (lower.includes('inspect film') || lower.includes('check media') || lower.includes('verify timeline')) {
       return { domain: 'film', action: 'inspect', path: '.' };
     }
     if (lower.includes('fix film') || lower.includes('fix media') || lower.includes('relink media') || lower.includes('fix timeline')) {
       return { domain: 'film', action: 'fix', path: '.' };
     }
-
     return null;
   }
 
-  // -------------------------------------------------------------------------
-  // Main Message Handler
-  // -------------------------------------------------------------------------
   private async _handleUserMessage(message: string) {
     this.outputChannel.appendLine('[Chat] User: ' + message);
     this.history.push({ role: 'user', content: message });
+
+    const lowerMsg = message.toLowerCase().trim();
+    if ((lowerMsg === 'fix the error' || lowerMsg === 'fix it' || lowerMsg === 'fix') && this.lastFailedCommand) {
+      this._postMessage({ type: 'status', text: 'Re-analyzing the last failed command...' });
+      await this._handleAutoFix(this.lastFailedCommand, this.lastFailedStdout || '', this.lastFailedStderr || '');
+      return;
+    }
 
     const cmdRequest = await this._parseCommandRequest(message);
     if (cmdRequest) { await this._handleCommandRequest(cmdRequest); return; }
@@ -266,7 +402,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      // AUTONOMOUS ACTION PLAN EXECUTION
       if (result.isActionPlan && result.actions && result.actions.length > 0) {
         this.pendingActionPlan = result.actions;
         let executionLog = result.actions.map((a: any, i: number) =>
@@ -281,7 +416,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      // NORMAL TEXT RESPONSE
       const responseText = result.response || 'No response received.';
       this.history.push({ role: 'assistant', content: responseText });
       this._postMessage({ type: 'response', text: this._formatMarkdown(responseText) });
@@ -291,9 +425,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Domain Execution Handler
-  // -------------------------------------------------------------------------
   private async _handleDomainRequest(req: { domain: string; action: string; path: string }) {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '.';
     const targetPath = path.isAbsolute(req.path) ? req.path : path.join(workspaceFolder, req.path);
@@ -305,24 +436,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           const report = await this.transport.request('pack.film.inspect', { path: targetPath }) as any;
           this.outputChannel.appendLine('[Chat] Film inspect raw report: ' + JSON.stringify(report, null, 2));
 
-          let detail = 'Project: ' + (report.root || targetPath) + '\n';
           const clips = report.clips || [];
-          detail += 'Total Clips: ' + clips.length + '\n';
-
           const missing = clips.filter((c: any) => !c.mediaExists);
-          const linked = clips.filter((c: any) => c.mediaExists);
-
-          detail += '\n--- Media Status ---\n';
-          detail += 'Linked: ' + linked.length + '\n';
-          detail += 'Missing: ' + missing.length + '\n';
+          let detail = `Project: ${report.root || targetPath}\nTotal Clips: ${clips.length}\n\n--- Media Status ---\nLinked: ${clips.length - missing.length}\nMissing: ${missing.length}`;
 
           if (missing.length > 0) {
-            detail += '\nMissing Files:\n';
-            missing.forEach((c: any) => { detail += '- ' + c.clipName + ' -> ' + c.mediaPath + '\n'; });
-          } else if (clips.length > 0) {
-            detail += '\nVerified Files:\n';
-            clips.slice(0, 10).forEach((c: any) => { detail += '- ' + c.clipName + ' (' + c.source + ')\n'; });
-            if (clips.length > 10) detail += '... and ' + (clips.length - 10) + ' more.\n';
+            detail += '\n\nMissing Files:\n' + missing.map((c: any) => `- ${c.clipName} -> ${c.mediaPath}`).join('\n');
           }
 
           this._postMessage({
@@ -338,8 +457,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this._postMessage({ type: 'status', text: 'Diagnosing missing media and generating relink patch...' });
         try {
           const diagnosis = await this.transport.request('pack.film.fix', { path: targetPath }) as any;
-          this.outputChannel.appendLine('[Chat] Film fix diagnosis: ' + JSON.stringify(diagnosis, null, 2));
-
           if (!diagnosis.missingClips || diagnosis.missingClips.length === 0) {
             this._postMessage({
               type: 'result',
@@ -350,14 +467,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             return;
           }
 
-          let detail = 'Missing Media Detected:\n\n';
-          diagnosis.proposedRelsinks.forEach((r: any) => {
-            detail += '  Missing: ' + r.missingFile + '\n';
-            detail += '  Relink to: ' + r.availableFile + '\n\n';
-          });
-
-          detail += 'This will update the EDL timeline file to point to available media.\n';
-          detail += 'Timeline: ' + diagnosis.timelinePath + '\n';
+          let detail = 'Missing Media Detected:\n\n' + diagnosis.proposedRelsinks.map((r: any) => `  Missing: ${r.missingFile}\n  Relink to: ${r.availableFile}\n`).join('\n') + `\nTimeline: ${diagnosis.timelinePath}`;
 
           this.pendingFilmFix = {
             path: targetPath,
@@ -368,10 +478,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this._postMessage({
             type: 'edit',
             filePath: diagnosis.timelinePath,
-            instruction: 'Relink ' + diagnosis.proposedRelsinks.length + ' missing media files to available assets',
-            changes: diagnosis.proposedRelsinks.length + ' media references will be updated',
+            instruction: `Relink ${diagnosis.proposedRelsinks.length} missing media files to available assets`,
+            changes: `${diagnosis.proposedRelsinks.length} media references will be updated`,
           });
-
         } catch (e: any) {
           this._postMessage({ type: 'result', status: 'error', title: 'Film Fix Failed', detail: e.message || String(e) });
         }
@@ -379,9 +488,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Command Execution Flow
-  // -------------------------------------------------------------------------
   private async _handleCommandRequest(cmd: { command: string; args: string[]; description: string }) {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '.';
     this.pendingCommand = { command: cmd.command, args: cmd.args, cwd: workspaceFolder, description: cmd.description };
@@ -400,7 +506,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     const cmd = this.pendingCommand;
-    this._postMessage({ type: 'status', text: 'Executing: ' + cmd.command + ' ' + cmd.args.join(' ') + '...' });
+    this._postMessage({ type: 'status', text: `Executing: ${cmd.command} ${cmd.args.join(' ')}...` });
 
     try {
       const result = await this.transport.request('chat.run', {
@@ -415,17 +521,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const success = result.success || result.exitCode === 0;
       const durationSec = (result.durationMs / 1000).toFixed(1);
 
-      let detail = 'Command: ' + cmd.command + ' ' + cmd.args.join(' ') + '\n';
-      detail += 'Exit code: ' + result.exitCode + '\n';
-      detail += 'Duration: ' + durationSec + 's\n';
+      let detail = `Command: ${cmd.command} ${cmd.args.join(' ')}\nExit code: ${result.exitCode}\nDuration: ${durationSec}s\n`;
       if (result.timedOut) detail += 'WARNING: Command timed out.\n';
-      if (result.truncated) detail += 'NOTE: Output was truncated.\n';
-      if (result.stdout && result.stdout.trim()) detail += '\n--- stdout ---\n' + result.stdout.trim();
-      if (result.stderr && result.stderr.trim()) detail += '\n--- stderr ---\n' + result.stderr.trim();
+      if (result.stdout && result.stdout.trim()) detail += `\n--- stdout ---\n${result.stdout.trim()}`;
+      if (result.stderr && result.stderr.trim()) detail += `\n--- stderr ---\n${result.stderr.trim()}`;
 
       this.history.push({
         role: 'assistant',
-        content: 'Executed "' + cmd.command + ' ' + cmd.args.join(' ') + '" — ' + (success ? 'Succeeded' : 'Failed') + ' (exit ' + result.exitCode + ', ' + durationSec + 's)',
+        content: `Executed "${cmd.command} ${cmd.args.join(' ')}" — ${success ? 'Succeeded' : 'Failed'} (exit ${result.exitCode}, ${durationSec}s)`,
       });
 
       this._postMessage({
@@ -437,40 +540,216 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         stderr: result.stderr || '',
         exitCode: result.exitCode,
         durationMs: result.durationMs,
-        command: cmd.command + ' ' + cmd.args.join(' ')
+        command: `${cmd.command} ${cmd.args.join(' ')}`
       });
-      this.pendingCommand = null;
 
-      if (!success && result.stderr) {
-        this._postMessage({ type: 'status', text: 'Build failed. Automatically diagnosing and fixing...' });
+      if (!success) {
+        this.lastFailedCommand = cmd.command + ' ' + cmd.args.join(' ');
+        this.lastFailedStdout = result.stdout || '';
+        this.lastFailedStderr = result.stderr || '';
+
+        this._postMessage({ type: 'status', text: 'Command failed. Automatically diagnosing and fixing...' });
         await new Promise(resolve => setTimeout(resolve, 1000));
-        this._handleAutoFix(cmd.command + ' ' + cmd.args.join(' '), result.stdout || '', result.stderr || '');
+        this._handleAutoFix(this.lastFailedCommand, this.lastFailedStdout || '', this.lastFailedStderr || '');
+      } else {
+        this.autoFixRetryCount = 0;
       }
 
+      this.pendingCommand = null;
     } catch (error: any) {
       this._postMessage({ type: 'result', status: 'error', title: 'Execution Error', detail: error.message || String(error) });
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Auto-Fix Flow (The Agentic Loop)
-  // -------------------------------------------------------------------------
   private async _handleAutoFix(command: string, stdout: string, stderr: string) {
-    this._postMessage({ type: 'status', text: 'Analyzing error to generate a multi-step fix...' });
+    this.autoFixRetryCount++;
+    if (this.autoFixRetryCount > 3) {
+      this._postMessage({
+        type: 'result',
+        status: 'error',
+        title: 'Auto-Fix Limit Reached',
+        detail: `The agent attempted 3 automatic fixes but the error persists. This usually indicates a complex configuration issue that requires manual intervention.\n\nFailed command: ${command}\n\nPlease review the error output above and fix manually, or provide more specific instructions.`
+      });
+      this.autoFixRetryCount = 0;
+      return;
+    }
+
+    this._postMessage({ type: 'status', text: `Analyzing error output (attempt ${this.autoFixRetryCount}/3)...` });
+    const classification = classifyError(command, stdout, stderr);
+
+    if (classification.type === 'missing_local_file' && classification.confidence > 0.8) {
+      this._postMessage({ type: 'status', text: `Detected missing local file '${classification.filePath}'. Instructing agent to create it...` });
+      try {
+        const preciseInstruction = `Create the missing local file '${classification.filePath}' with a basic, valid implementation that satisfies the imports. DO NOT suggest 'npm install'. This is a local source file, not an npm package.`;
+        await this._autoApplyEdit(classification.filePath, preciseInstruction);
+
+        // After creating the file, re-run the failed command to verify
+        this._postMessage({ type: 'status', text: 'File created. Re-running command to verify...' });
+        const cmdParts = command.split(' ');
+        if (cmdParts.length > 0 && cmdParts[0]) {
+          await this._autoRunCommand(cmdParts[0], cmdParts.slice(1));
+        }
+      } catch (e: any) {
+        this._postMessage({ type: 'result', status: 'error', title: 'Auto-Create Failed', detail: e.message });
+      }
+      return;
+    }
+
+    if (classification.type === 'out_of_memory' && classification.confidence > 0.9) {
+      this._postMessage({ type: 'status', text: 'Detected Out of Memory. Increasing Node heap size and retrying...' });
+      try {
+        const cmdParts = command.split(' ');
+        await this._autoRunCommand('npx', ['cross-env', 'NODE_OPTIONS=--max-old-space-size=4096', ...cmdParts]);
+      } catch (e: any) {
+        this._postMessage({ type: 'result', status: 'error', title: 'OOM Retry Failed', detail: e.message });
+      }
+      return;
+    }
+
+    if (classification.type === 'command_not_found' && classification.confidence > 0.8) {
+      this._postMessage({ type: 'result', status: 'error', title: 'Command Not Found', detail: `The command '${classification.command}' is not installed or not in your system PATH. Please install it globally or add it to your project's devDependencies.` });
+      return;
+    }
+
+    if (classification.type === 'permission_denied' && classification.confidence > 0.8) {
+      this._postMessage({ type: 'result', status: 'error', title: 'Permission Denied', detail: `Access denied to '${classification.filePath}'. Try running VS Code as Administrator, or check file/folder permissions.` });
+      return;
+    }
+
+    if (classification.type === 'network_error' && classification.confidence > 0.8) {
+      this._postMessage({ type: 'result', status: 'error', title: 'Network Error', detail: `${classification.message} Please check your internet connection or npm registry configuration.` });
+      return;
+    }
+
+    if (classification.type === 'git_conflict' && classification.confidence > 0.8) {
+      this._postMessage({ type: 'result', status: 'error', title: 'Git Merge Conflict', detail: `Merge conflict detected in '${classification.filePath}'. Please resolve the '<<<<<<< HEAD' markers manually before continuing.` });
+      return;
+    }
+
+    if (classification.type === 'missing_dependency' && classification.confidence > 0.8) {
+      this._postMessage({ type: 'status', text: `Detected missing dependency: '${classification.packageName}'. Auto-installing...` });
+      try {
+        await this._autoRunCommand('npm', ['install', classification.packageName]);
+        this._postMessage({ type: 'status', text: 'Dependency installed. Re-running command...' });
+        const cmdParts = command.split(' ');
+        if (cmdParts.length > 0 && cmdParts[0]) {
+          await this._autoRunCommand(cmdParts[0], cmdParts.slice(1));
+        }
+      } catch (e: any) {
+        this._postMessage({ type: 'result', status: 'error', title: 'Auto-Install Failed', detail: e.message });
+      }
+      return;
+    }
+
+    if (classification.type === 'port_in_use' && classification.confidence > 0.8) {
+      this._postMessage({ type: 'status', text: `Detected port ${classification.port} in use. Killing process...` });
+      try {
+        await this._autoRunCommand('npx', ['kill-port', classification.port.toString()]);
+        this._postMessage({ type: 'status', text: 'Port cleared. Re-running command...' });
+        const cmdParts = command.split(' ');
+        if (cmdParts.length > 0 && cmdParts[0]) {
+          await this._autoRunCommand(cmdParts[0], cmdParts.slice(1));
+        }
+      } catch (e: any) {
+        this._postMessage({ type: 'result', status: 'error', title: 'Port Kill Failed', detail: e.message });
+      }
+      return;
+    }
+
+    if (classification.type === 'syntax_error' && classification.confidence > 0.8) {
+      this._postMessage({ type: 'status', text: `Detected syntax error in ${classification.filePath} at line ${classification.line}. Generating targeted fix...` });
+      try {
+        const preciseInstruction = `Fix the syntax error at line ${classification.line}. The compiler says: "${classification.message}". Output ONLY the corrected code for this file. Do not change unrelated logic.`;
+        await this._handleEditRequest(classification.filePath, preciseInstruction, true, command);
+      } catch (e: any) {
+        this._postMessage({ type: 'result', status: 'error', title: 'Auto-Patch Failed', detail: e.message });
+      }
+      return;
+    }
+
+    this._postMessage({ type: 'status', text: 'Complex error detected. Consulting AI debugger...' });
     try {
       const diag = await this.transport.request('chat.diagnose', { command, stdout, stderr }) as any;
+      const advice = (diag as any).response || diag.fallbackInstruction || diag.instruction;
+
+      if (!diag.filePath && (!diag.actions || diag.actions.length === 0)) {
+        if (advice && advice.length > 20) {
+          this._postMessage({
+            type: 'result',
+            status: 'error',
+            title: 'AI Debugger Advice',
+            detail: 'The error could not be automatically fixed, but the AI suggests:\n\n' + advice
+          });
+        } else {
+          this._postMessage({ type: 'result', status: 'error', title: 'Cannot Auto-Fix', detail: 'Could not identify a specific file or action to fix this error.' });
+        }
+        return;
+      }
 
       if (diag.actions && Array.isArray(diag.actions) && diag.actions.length > 0) {
-        this._postMessage({ type: 'status', text: `Executing ${diag.actions.length} auto-fix steps...` });
+        this._postMessage({ type: 'status', text: `Executing ${diag.actions.length} AI-generated fix steps...` });
+
         for (const action of diag.actions) {
-          if (action.type === 'edit') {
-            await this._autoApplyEdit(action.filePath, action.instruction);
-          } else if (action.type === 'run') {
-            await this._autoRunCommand(action.command, action.args || []);
+          const typedAction = action as { type: string; command?: string; args?: string[]; filePath?: string; instruction?: string };
+
+
+          if (typedAction.type === 'run' && typedAction.command === 'npm' && typedAction.args) {
+            const firstArg = typedAction.args[0];
+            const isInstall = typeof firstArg === 'string' && ['install', 'i', 'add'].includes(firstArg);
+            if (isInstall) {
+              const targets = typedAction.args.filter((arg: string) => !arg.startsWith('-'));
+
+              const hasLocalPath = targets.some((t: string) => {
+                const isScopedPackage = t.startsWith('@') && t.split('/').length >= 2;
+                return t.startsWith('.') ||
+                  t.startsWith('/') ||
+                  t.includes('\\') ||
+                  (!isScopedPackage && t.includes('/')) ||
+                  /\.(ts|tsx|js|jsx|mjs|cjs|json)$/i.test(t);
+              });
+
+              if (hasLocalPath) {
+                this.outputChannel.appendLine(`[Auto-Fix Guardrail] Intercepted hallucinated npm install for local path.`);
+                this._postMessage({
+                  type: 'status',
+                  text: `Guardrail Active: Blocked 'npm install'. Detected local file path(s). Generating missing file(s) instead...`
+                });
+
+                for (const target of targets) {
+                  const isScopedPackage = target.startsWith('@') && target.split('/').length >= 2;
+                  const isLocal = target.startsWith('.') || target.startsWith('/') || target.includes('\\') || (!isScopedPackage && target.includes('/')) || /\.(ts|tsx|js|jsx|mjs|cjs|json)$/i.test(target);
+
+                  if (isLocal) {
+                    let targetPath = target;
+                    if (!/\.[a-z0-9]+$/i.test(targetPath)) {
+                      targetPath = targetPath.endsWith('/') || targetPath.endsWith('\\') ? targetPath + 'index.ts' : targetPath + '.ts';
+                    }
+                    targetPath = path.posix.normalize(targetPath).replace(/\//g, path.sep);
+
+                    const smartInstruction = `CRITICAL FIX: The build failed because this local file is missing. Create the file '${targetPath}' with a valid, minimal, and type-safe implementation that satisfies the importing file's expectations. STRICT RULES: 1. DO NOT output placeholder comments. Write actual working code. 2. Ensure all exported function/variable names match exactly what the importer expects. 3. If this is a utility file, provide standard implementations.`;
+
+                    await this._autoApplyEdit(targetPath, smartInstruction);
+                  }
+                }
+                continue;
+              }
+            }
+          }
+
+          if (typedAction.type === 'edit' && typedAction.filePath && typedAction.instruction) {
+            await this._autoApplyEdit(typedAction.filePath, typedAction.instruction);
+          } else if (typedAction.type === 'run' && typedAction.command) {
+            const cmdStr = `${typedAction.command} ${(typedAction.args || []).join(' ')}`.toLowerCase();
+            if (cmdStr.includes('rm -rf /') || cmdStr.includes('del /s /q') || cmdStr.includes('format ')) {
+              this.outputChannel.appendLine(`[Auto-Fix Guardrail] Blocked dangerous command: ${cmdStr}`);
+              this._postMessage({ type: 'result', status: 'error', title: 'Blocked Dangerous Command', detail: `Refused to execute potentially destructive command: ${typedAction.command} ${(typedAction.args || []).join(' ')}` });
+              continue;
+            }
+            await this._autoRunCommand(typedAction.command, typedAction.args || []);
           }
         }
-        // After applying all fix steps, re-run the original failed command to verify
-        this._postMessage({ type: 'status', text: 'Verifying auto-fix by re-running the failed command...' });
+
+        this._postMessage({ type: 'status', text: 'Verifying AI fix by re-running the failed command...' });
         const cmdParts = command.split(' ');
         if (cmdParts.length > 0 && cmdParts[0]) {
           await this._autoRunCommand(cmdParts[0], cmdParts.slice(1));
@@ -478,13 +757,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      // Fallback to old single-file edit if the LLM didn't output actions
-      if (!diag.filePath) {
-        this._postMessage({ type: 'result', status: 'error', title: 'Cannot Auto-Fix', detail: diag.fallbackInstruction || diag.instruction || 'Could not identify a specific file to fix.' });
-        return;
-      }
-
-      this._postMessage({ type: 'status', text: 'Found issue in ' + diag.filePath + '. Generating fix...' });
+      this._postMessage({ type: 'status', text: `Found issue in ${diag.filePath}. Generating fix...` });
       await this._handleEditRequest(diag.filePath, diag.instruction, true, command);
 
     } catch (e: any) {
@@ -492,9 +765,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  // -------------------------------------------------------------------------
-  // File Edit Flow
-  // -------------------------------------------------------------------------
   private async _handleEditRequest(filePath: string, instruction: string, isAutoFix: boolean = false, failedCmd: string | null = null) {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     if (!workspaceFolder) {
@@ -503,16 +773,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     const fullPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceFolder, filePath);
 
-    this._postMessage({ type: 'status', text: 'Reading ' + filePath + '...' });
+    this._postMessage({ type: 'status', text: `Reading ${filePath}...` });
     let fileContent = '';
     try {
       fileContent = await fs.readFile(fullPath, 'utf8');
     } catch {
-      this._postMessage({ type: 'result', status: 'error', title: 'File Not Found', detail: 'Could not find: ' + filePath });
+      this._postMessage({ type: 'result', status: 'error', title: 'File Not Found', detail: `Could not find: ${filePath}` });
       return;
     }
 
-    this._postMessage({ type: 'status', text: 'Generating edit for ' + filePath + '...' });
+    this._postMessage({ type: 'status', text: `Generating edit for ${filePath}...` });
     try {
       const result = await this.transport.request('chat.edit', { filePath, instruction, fileContent }) as any;
       if (result.error) {
@@ -530,7 +800,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.pendingFailedCommand = failedCmd;
 
       const lineDiff = this._countChangedLines(result.originalContent, result.editedContent);
-      this._postMessage({ type: 'edit', filePath: filePath, instruction: instruction, changes: lineDiff });
+      this._postMessage({ type: 'edit', filePath, instruction, changes: lineDiff });
     } catch (error: any) {
       this._postMessage({ type: 'result', status: 'error', title: 'Edit Failed', detail: error.message || String(error) });
     }
@@ -560,17 +830,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const fullPath = path.isAbsolute(filePath) ? filePath : path.join(workspaceFolder, filePath);
 
     try {
-      // Ensure the parent directory exists before attempting to read or write
       await fs.mkdir(path.dirname(fullPath), { recursive: true });
-
       let fileContent = '';
-      try { fileContent = await fs.readFile(fullPath, 'utf8'); } catch { /* empty file */ }
+      try { fileContent = await fs.readFile(fullPath, 'utf8'); } catch { }
 
       const result = await this.transport.request('chat.edit', { filePath: fullPath, instruction, fileContent }) as any;
       if (result.error) throw new Error(result.error.message);
 
-      const backupPath = fullPath + '.bak';
-      await fs.writeFile(backupPath, fileContent, 'utf8');
+      await fs.writeFile(fullPath + '.bak', fileContent, 'utf8');
       await fs.writeFile(fullPath, result.editedContent, 'utf8');
 
       this._postMessage({ type: 'response', text: this._formatMarkdown(`**Auto-Edit Applied:** \`${filePath}\``) });
@@ -585,13 +852,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const result = await this.transport.request('chat.run', { command, args, cwd: workspaceFolder }) as any;
       let success = result.exitCode === 0 && !result.timedOut;
 
-      // SPECIAL HANDLING: If a test command times out due to watch mode (--watchAll),
-      // analyze the output to determine if tests actually passed.
       if (result.timedOut) {
         const output = ((result.stdout || '') + (result.stderr || '')).replace(/\x1b\[[0-9;]*m/g, '');
         const hasPass = output.includes('PASS ') || /Tests:\s+\d+ passed/.test(output);
         const hasFail = output.includes('FAIL ') || /failed/.test(output);
-        // Only count as success if there are passes AND zero failures
         if (hasPass && !hasFail && output.includes('Test Suites:')) {
           success = true;
         }
@@ -618,7 +882,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async _applyFilmFix() {
     if (!this.pendingFilmFix) return;
-
     this._postMessage({ type: 'status', text: 'Applying EDL relink patch...' });
     try {
       const result = await this.transport.request('pack.film.applyFix', {
@@ -627,18 +890,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         relinks: this.pendingFilmFix.relinks,
       }) as any;
 
-      this.outputChannel.appendLine('[Chat] Film fix result: ' + JSON.stringify(result, null, 2));
-
       if (result.success) {
         this._postMessage({
           type: 'result',
           status: 'success',
           title: 'Film Fix Applied and Verified',
-          detail: 'Successfully relinked ' + result.fixedCount + ' media files.\n' +
-            'Timeline: ' + this.pendingFilmFix.timelinePath + '\n' +
-            'All media references are now linked.',
+          detail: `Successfully relinked ${result.fixedCount} media files.\nTimeline: ${this.pendingFilmFix.timelinePath}\nAll media references are now linked.`,
         });
-        this.history.push({ role: 'assistant', content: 'Fixed ' + result.fixedCount + ' missing media links in ' + this.pendingFilmFix.timelinePath });
+        this.history.push({ role: 'assistant', content: `Fixed ${result.fixedCount} missing media links in ${this.pendingFilmFix.timelinePath}` });
       } else {
         this._postMessage({
           type: 'result',
@@ -662,7 +921,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     for (let i = 0; i < maxLen; i++) {
       if (origLines[i] !== editLines[i]) { added++; removed++; }
     }
-    return '+' + added + ' added, -' + removed + ' removed';
+    return `+${added} added, -${removed} removed`;
   }
 
   private async _showDiffPreview() {
@@ -690,21 +949,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         ? path.relative(vscode.workspace.workspaceFolders[0].uri.fsPath, this.pendingEdit.filePath)
         : this.pendingEdit.filePath;
 
-      this.history.push({ role: 'assistant', content: 'Edited ' + relativePath + ': ' + this.pendingEdit.instruction });
+      this.history.push({ role: 'assistant', content: `Edited ${relativePath}: ${this.pendingEdit.instruction}` });
       this._postMessage({
         type: 'result',
         status: 'success',
         title: 'File Saved Successfully',
-        detail: 'File: ' + relativePath + '\nInstruction: ' + this.pendingEdit.instruction + '\nBackup: ' + path.basename(backupPath),
+        detail: `File: ${relativePath}\nInstruction: ${this.pendingEdit.instruction}\nBackup: ${path.basename(backupPath)}`,
       });
 
-      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(this.pendingEdit.filePath));
-      await vscode.window.showTextDocument(doc);
+      await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(this.pendingEdit.filePath)));
 
       if (isAutoFix) {
         this._postMessage({ type: 'status', text: 'Verifying AI fix by re-running build...' });
-
-        // Re-run the exact command that failed, or fallback to build
         const cmdToRun = this.pendingFailedCommand || 'npm run build';
         const cmdParts = cmdToRun.split(' ');
         const verifyResult = await this.transport.request('chat.run', {
@@ -716,12 +972,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (verifyResult.exitCode !== 0) {
           this._postMessage({ type: 'status', text: 'AI fix failed verification. Reverting to backup...' });
           await fs.writeFile(this.pendingEdit.filePath, this.pendingEdit.originalContent, 'utf8');
-
           this._postMessage({
             type: 'result',
             status: 'error',
             title: 'AI Fix Reverted',
-            detail: 'The AI attempted a fix, but the build still failed (exit code ' + verifyResult.exitCode + '). Your file has been safely restored from the .bak backup to prevent code corruption.'
+            detail: `The AI attempted a fix, but the build still failed (exit code ${verifyResult.exitCode}). Your file has been safely restored from the .bak backup.`
           });
         } else {
           this._postMessage({
@@ -736,15 +991,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.pendingEdit = null;
       this.pendingEditIsAutoFix = false;
       this.pendingFailedCommand = null;
-
     } catch (error: any) {
       this._postMessage({ type: 'result', status: 'error', title: 'Save Failed', detail: error.message || String(error) });
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Formatting Helpers
-  // -------------------------------------------------------------------------
   private _formatMarkdown(text: string): string {
     let html = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _l, code) => '<pre class="code-block">' + code.trim() + '</pre>');
@@ -765,9 +1016,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (this._view) this._view.webview.postMessage(message);
   }
 
-  // -------------------------------------------------------------------------
-  // Webview HTML & UI Logic
-  // -------------------------------------------------------------------------
   private _getHtmlForWebview() {
     return `<!DOCTYPE html>
 <html lang="en">
@@ -828,147 +1076,77 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     let lastFailedOutput = null;
 
     function addUserMessage(text) {
-      const div = document.createElement('div');
-      div.className = 'msg msg-user';
-      div.textContent = text;
-      chatContainer.appendChild(div);
-      scrollToBottom();
+      const div = document.createElement('div'); div.className = 'msg msg-user'; div.textContent = text;
+      chatContainer.appendChild(div); scrollToBottom();
     }
-
     function addAssistantMessage(html) {
-      removeStatus();
-      const div = document.createElement('div');
-      div.className = 'msg msg-assistant';
-      div.innerHTML = html;
-      chatContainer.appendChild(div);
-      scrollToBottom();
+      removeStatus(); const div = document.createElement('div'); div.className = 'msg msg-assistant'; div.innerHTML = html;
+      chatContainer.appendChild(div); scrollToBottom();
     }
-
     function setStatus(text) {
-      removeStatus();
-      statusBar = document.createElement('div');
-      statusBar.className = 'status-bar';
+      removeStatus(); statusBar = document.createElement('div'); statusBar.className = 'status-bar';
       statusBar.innerHTML = '<span class="codicon codicon-sync"></span> ' + text;
-      chatContainer.appendChild(statusBar);
-      scrollToBottom();
+      chatContainer.appendChild(statusBar); scrollToBottom();
     }
-
-    function removeStatus() {
-      if (statusBar) { statusBar.remove(); statusBar = null; }
-    }
-
+    function removeStatus() { if (statusBar) { statusBar.remove(); statusBar = null; } }
     function addResultCard(status, title, detail, stdout, stderr, exitCode, durationMs, command) {
       removeStatus();
       const iconMap = { success: 'pass', failure: 'error', error: 'error', rejected: 'close' };
       const colorMap = { success: 'var(--vscode-testing-iconPassed)', failure: 'var(--vscode-testing-iconFailed)', error: 'var(--vscode-errorForeground)', rejected: 'var(--vscode-descriptionForeground)' };
-      const icon = iconMap[status] || 'info';
-      const color = colorMap[status] || 'inherit';
-
-      const div = document.createElement('div');
-      div.className = 'result-card result-' + status;
-      let html = '<div class="result-title"><span class="codicon codicon-' + icon + '" style="color:' + color + '"></span> ' + title + '</div>';
+      const div = document.createElement('div'); div.className = 'result-card result-' + status;
+      let html = '<div class="result-title"><span class="codicon codicon-' + iconMap[status] + '" style="color:' + colorMap[status] + '"></span> ' + title + '</div>';
       if (detail) html += '<div class="result-detail">' + escapeHtml(detail) + '</div>';
-
       if (status === 'failure' && command) {
-        lastFailedOutput = { command: command, stdout: stdout, stderr: stderr };
+        lastFailedOutput = { command, stdout, stderr };
         html += '<div class="action-bar"><button class="btn-primary" onclick="autoFix()"><span class="codicon codicon-bug"></span> Auto-Fix Error</button></div>';
       }
-
-      div.innerHTML = html;
-      chatContainer.appendChild(div);
-      scrollToBottom();
+      div.innerHTML = html; chatContainer.appendChild(div); scrollToBottom();
     }
-
     function addCommandCard(command, description, cwd) {
-      removeStatus();
-      const div = document.createElement('div');
-      div.className = 'action-card';
-      div.innerHTML =
-        '<h4><span class="codicon codicon-terminal"></span> Command Ready</h4>' +
+      removeStatus(); const div = document.createElement('div'); div.className = 'action-card';
+      div.innerHTML = '<h4><span class="codicon codicon-terminal"></span> Command Ready</h4>' +
         '<p><strong>Command:</strong> <code>' + escapeHtml(command) + '</code></p>' +
         '<p><strong>Description:</strong> ' + escapeHtml(description) + '</p>' +
         '<p><strong>Working dir:</strong> <code>' + escapeHtml(cwd) + '</code></p>' +
-        '<div class="action-bar">' +
-          '<button class="btn-primary" onclick="runCommand()"><span class="codicon codicon-play"></span> Run Command</button>' +
-          '<button class="btn-danger" onclick="rejectCommand()"><span class="codicon codicon-close"></span> Cancel</button>' +
-        '</div>';
-      chatContainer.appendChild(div);
-      scrollToBottom();
+        '<div class="action-bar"><button class="btn-primary" onclick="runCommand()"><span class="codicon codicon-play"></span> Run Command</button>' +
+        '<button class="btn-danger" onclick="rejectCommand()"><span class="codicon codicon-close"></span> Cancel</button></div>';
+      chatContainer.appendChild(div); scrollToBottom();
     }
-
     function addEditCard(filePath, instruction, changes) {
-      removeStatus();
-      const div = document.createElement('div');
-      div.className = 'action-card';
-      div.innerHTML =
-        '<h4><span class="codicon codicon-diff"></span> Proposed Edit</h4>' +
+      removeStatus(); const div = document.createElement('div'); div.className = 'action-card';
+      div.innerHTML = '<h4><span class="codicon codicon-diff"></span> Proposed Edit</h4>' +
         '<p><strong>File:</strong> <code>' + escapeHtml(filePath) + '</code></p>' +
         '<p><strong>Instruction:</strong> ' + escapeHtml(instruction) + '</p>' +
         '<p><strong>Changes:</strong> ' + escapeHtml(changes) + '</p>' +
-        '<div class="action-bar">' +
-          '<button class="btn-secondary" onclick="viewDiff()"><span class="codicon codicon-diff"></span> Preview Diff</button>' +
-          '<button class="btn-success" onclick="approveEdit()"><span class="codicon codicon-check"></span> Approve & Save</button>' +
-          '<button class="btn-danger" onclick="rejectEdit()"><span class="codicon codicon-close"></span> Reject</button>' +
-        '</div>';
-      chatContainer.appendChild(div);
-      scrollToBottom();
+        '<div class="action-bar"><button class="btn-secondary" onclick="viewDiff()"><span class="codicon codicon-diff"></span> Preview Diff</button>' +
+        '<button class="btn-success" onclick="approveEdit()"><span class="codicon codicon-check"></span> Approve & Save</button>' +
+        '<button class="btn-danger" onclick="rejectEdit()"><span class="codicon codicon-close"></span> Reject</button></div>';
+      chatContainer.appendChild(div); scrollToBottom();
     }
-
     function addPlanCard(steps) {
-      removeStatus();
-      const div = document.createElement('div');
-      div.className = 'action-card';
-      div.innerHTML =
-        '<h4><span class="codicon codicon-rocket"></span> Autonomous Plan Ready</h4>' +
+      removeStatus(); const div = document.createElement('div'); div.className = 'action-card';
+      div.innerHTML = '<h4><span class="codicon codicon-rocket"></span> Autonomous Plan Ready</h4>' +
         '<p>I have planned ' + steps.length + ' steps to implement your request:</p>' +
         '<ul style="margin: 8px 0 8px 20px; line-height: 1.6;">' + steps.map(s => '<li>' + escapeHtml(s) + '</li>').join('') + '</ul>' +
-        '<div class="action-bar">' +
-          '<button class="btn-success" onclick="executePlan()"><span class="codicon codicon-play"></span> Execute Entire Plan</button>' +
-        '</div>';
-      chatContainer.appendChild(div);
-      scrollToBottom();
+        '<div class="action-bar"><button class="btn-success" onclick="executePlan()"><span class="codicon codicon-play"></span> Execute Entire Plan</button></div>';
+      chatContainer.appendChild(div); scrollToBottom();
     }
-
-    function escapeHtml(text) {
-      if (!text) return '';
-      return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    }
-
-    function scrollToBottom() {
-      chatContainer.scrollTop = chatContainer.scrollHeight;
-    }
-
+    function escapeHtml(text) { if (!text) return ''; return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+    function scrollToBottom() { chatContainer.scrollTop = chatContainer.scrollHeight; }
     function runCommand() { vscode.postMessage({ type: 'runCommand' }); removeLastActionBar(); }
     function rejectCommand() { vscode.postMessage({ type: 'rejectCommand' }); removeLastActionBar(); }
     function approveEdit() { vscode.postMessage({ type: 'approveEdit' }); removeLastActionBar(); }
     function rejectEdit() { vscode.postMessage({ type: 'rejectEdit' }); removeLastActionBar(); }
     function viewDiff() { vscode.postMessage({ type: 'viewDiff' }); }
     function executePlan() { vscode.postMessage({ type: 'executePlan' }); removeLastActionBar(); }
-
-    function autoFix() {
-      if (lastFailedOutput) {
-        vscode.postMessage({ type: 'autoFix', ...lastFailedOutput });
-      }
-    }
-
-    function removeLastActionBar() {
-      const bars = document.querySelectorAll('.action-bar');
-      if (bars.length > 0) bars[bars.length - 1].remove();
-    }
+    function autoFix() { if (lastFailedOutput) vscode.postMessage({ type: 'autoFix', ...lastFailedOutput }); }
+    function removeLastActionBar() { const bars = document.querySelectorAll('.action-bar'); if (bars.length > 0) bars[bars.length - 1].remove(); }
 
     sendBtn.addEventListener('click', function() {
       const text = messageInput.value.trim();
-      if (text) {
-        addUserMessage(text);
-        vscode.postMessage({ type: 'sendMessage', text: text });
-        messageInput.value = '';
-      }
+      if (text) { addUserMessage(text); vscode.postMessage({ type: 'sendMessage', text }); messageInput.value = ''; }
     });
-
-    messageInput.addEventListener('keypress', function(e) {
-      if (e.key === 'Enter') sendBtn.click();
-    });
-
+    messageInput.addEventListener('keypress', function(e) { if (e.key === 'Enter') sendBtn.click(); });
     window.addEventListener('message', function(event) {
       const msg = event.data;
       switch (msg.type) {
